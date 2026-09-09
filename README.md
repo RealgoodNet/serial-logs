@@ -239,6 +239,8 @@ serialctl attach
 
 默认是固定输入行模式。串口异步输出显示在上方，当前输入不会被输出冲散；本地支持左右移动、Home/End、Backspace 和上下历史，按 Enter 才发送整行。
 
+固定模式还会对少量高频网络状态做快速高亮：`[network.c][rk_network_get_cable_state]` 使用 256 色 `214`，`[wlan0] link down` 使用加粗橙色。错误关键词使用红色，成功/启动节点使用绿色或青色，高频 `MD: md_area` 信息使用暗灰色。高亮只作用于终端画面，不修改串口日志文件、JSONL 或 `--raw` 输出。
+
 以下场景使用原始逐字节模式：
 
 ```bash

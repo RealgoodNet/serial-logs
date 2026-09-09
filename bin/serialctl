@@ -110,6 +110,146 @@ def attach_message_output(msg):
     return b""
 
 
+HIGHLIGHT_RULES = (
+    (
+        b"[network.c][rk_network_get_cable_state]",
+        b"\x1b[38;5;214m",
+    ),
+    (
+        b"[wlan0] link down",
+        b"\x1b[1;38;5;214m",
+    ),
+    (
+        b"[wlan0] link up",
+        b"\x1b[1;32m",
+    ),
+)
+
+HIGHLIGHT_REGEX = re.compile(
+    rb"(?P<critical>(?<![A-Za-z0-9_])"
+    rb"(?:ERROR|ERR|FATAL|PANIC|OOPS|SEGFAULT|ASSERT)"
+    rb"(?![A-Za-z0-9_]))"
+    rb"|(?P<error_level>(?<![A-Za-z0-9_])E:)"
+    rb"|(?P<warning>(?<![A-Za-z0-9_])"
+    rb"(?:fail(?:ed|ure)?|cannot|can.t|can not|invalid|unrecognized|"
+    rb"unknown raw|no such file|not found|could not|"
+    rb"unsupported|not support(?:ed)?|timeout|timed out|"
+    rb"broken pipe|lost (?:video|audio) packet|session not found)"
+    rb"(?![A-Za-z0-9_]))"
+    rb"|(?P<success>(?<![A-Za-z0-9_])"
+    rb"(?:OK|success(?:fully)?|connected|ready|mounted|started|login:)"
+    rb"(?![A-Za-z0-9_]))"
+    rb"|(?P<startup>U-Boot|Starting kernel|Linux version|DDR4?)"
+    rb"|(?P<debug>MD: md_area)",
+    re.IGNORECASE,
+)
+HIGHLIGHT_REGEX_COLORS = {
+    "critical": b"\x1b[1;31m",
+    "error_level": b"\x1b[1;31m",
+    "warning": b"\x1b[38;5;214m",
+    "success": b"\x1b[1;32m",
+    "startup": b"\x1b[1;36m",
+    "debug": b"\x1b[2;37m",
+}
+
+# Keep these spellings so a keyword split across RX packets remains matchable.
+HIGHLIGHT_REGEX_LITERALS = (
+    b"ERROR",
+    b"ERR",
+    b"E:",
+    b"FATAL",
+    b"PANIC",
+    b"OOPS",
+    b"SEGFAULT",
+    b"ASSERT",
+    b"failed",
+    b"failure",
+    b"cannot",
+    b"can't",
+    b"can not",
+    b"invalid",
+    b"unrecognized",
+    b"unknown raw",
+    b"no such file",
+    b"not found",
+    b"could not",
+    b"not supported",
+    b"timeout",
+    b"timed out",
+    b"broken pipe",
+    b"lost video packet",
+    b"lost audio packet",
+    b"session not found",
+    b"OK",
+    b"successfully",
+    b"connected",
+    b"ready",
+    b"mounted",
+    b"started",
+    b"login:",
+    b"U-Boot",
+    b"Starting kernel",
+    b"Linux version",
+    b"DDR4",
+    b"MD: md_area",
+)
+HIGHLIGHT_WORD_BYTES = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+
+
+def highlight_serial_output(data, pending=b"", flush=False):
+    data = pending + data
+    keep = 0
+
+    # Keep only a suffix that could become a complete keyword on the next RX.
+    if not flush:
+        for needle, _ in HIGHLIGHT_RULES:
+            limit = min(len(needle) - 1, len(data))
+            for length in range(limit, 0, -1):
+                if data.endswith(needle[:length]):
+                    keep = max(keep, length)
+                    break
+
+        regex_match_at_end = False
+        for match in HIGHLIGHT_REGEX.finditer(data):
+            if match and match.end() == len(data):
+                regex_match_at_end = True
+                break
+
+        if not regex_match_at_end:
+            lower_data = data.lower()
+            for needle in HIGHLIGHT_REGEX_LITERALS:
+                needle = needle.lower()
+                limit = min(len(needle) - 1, len(data))
+                for length in range(limit, 0, -1):
+                    starts_at = len(data) - length
+                    if (
+                        lower_data.endswith(needle[:length])
+                        and (
+                            starts_at == 0
+                            or data[starts_at - 1] not in HIGHLIGHT_WORD_BYTES
+                        )
+                    ):
+                        keep = max(keep, length)
+                        break
+
+    visible = data[:-keep] if keep else data
+    pending = data[-keep:] if keep else b""
+
+    # Apply regex rules in one pass so ANSI reset codes do not affect boundaries.
+    def style_match(match):
+        color = HIGHLIGHT_REGEX_COLORS[match.lastgroup]
+        return color + match.group(0) + b"\x1b[0m"
+
+    visible = HIGHLIGHT_REGEX.sub(style_match, visible)
+
+    for needle, color in HIGHLIGHT_RULES:
+        visible = visible.replace(needle, color + needle + b"\x1b[0m")
+
+    return visible, pending
+
+
 def display_attach_message(msg, stdout_fd):
     data = attach_message_output(msg)
     if data:
@@ -168,6 +308,7 @@ class BottomLine:
         self.history = []
         self.history_index = None
         self.pending = bytearray()
+        self.highlight_pending = b""
         self.escape_deadline = None
         self.started = False
 
@@ -209,6 +350,14 @@ class BottomLine:
     def stop(self):
         if not self.started:
             return
+        if self.highlight_pending:
+            pending, self.highlight_pending = highlight_serial_output(
+                b"",
+                self.highlight_pending,
+                flush=True,
+            )
+            self._write(b"\x1b[u" + pending + b"\x1b[s")
+            self.redraw()
         self._write(b"\x1b[r\x1b[?1049l")
         self.started = False
 
@@ -250,7 +399,17 @@ class BottomLine:
         if not data:
             return
         self._resize_if_needed()
-        self._write(b"\x1b[u" + data + b"\x1b[s")
+        data, self.highlight_pending = highlight_serial_output(
+            data,
+            self.highlight_pending,
+        )
+        if not data:
+            return
+        self._write(
+            b"\x1b[u"
+            + data
+            + b"\x1b[s"
+        )
         self.redraw()
 
     def handle_message(self, msg):
