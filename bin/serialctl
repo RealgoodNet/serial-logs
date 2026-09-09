@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import collections
+import json
+import os
+import re
+import select
+import socket
+import sys
+import termios
+import time
+import tty
+import unicodedata
+from pathlib import Path
+
+
+DEFAULT_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
+    "seriald-rv1126b.sock",
+)
+
+DEFAULT_LOG_DIR = Path.home() / "work/serial-logs/rv1126b"
+
+
+def connect_socket(socket_path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    try:
+        s.connect(os.path.expanduser(socket_path))
+    except FileNotFoundError:
+        s.close()
+        print(
+            f"seriald socket 不存在: {socket_path}\n"
+            f"检查: systemctl --user status seriald-rv1126b",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except ConnectionRefusedError:
+        s.close()
+        print("seriald 没有运行", file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        s.close()
+        print(f"无法连接 seriald socket {socket_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    return s
+
+
+def recv_json_line(s, buffer=b""):
+    while b"\n" not in buffer:
+        chunk = s.recv(65536)
+        if not chunk:
+            raise RuntimeError("seriald closed the connection")
+        buffer += chunk
+
+    line, buffer = buffer.split(b"\n", 1)
+    return json.loads(line.decode("utf-8")), buffer
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def send_all(s, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = s.send(view)
+        except BlockingIOError:
+            select.select([], [s], [])
+            continue
+
+        if written == 0:
+            raise RuntimeError("seriald closed the attach connection")
+        view = view[written:]
+
+
+def send_attach_data(s, data):
+    if not data:
+        return
+
+    msg = {
+        "type": "tx",
+        "data_b64": base64.b64encode(data).decode("ascii"),
+    }
+    send_all(s, (json.dumps(msg) + "\n").encode("utf-8"))
+
+
+def attach_message_output(msg):
+    msg_type = msg.get("type")
+
+    if msg_type == "rx":
+        data_b64 = msg.get("data_b64")
+        if data_b64 is not None:
+            return base64.b64decode(data_b64, validate=True)
+
+        # Compatibility with an older seriald that sent decoded text.
+        return msg.get("data", "").encode("utf-8", errors="replace")
+
+    if msg_type == "error":
+        error = str(msg.get("error", "unknown error"))
+        return f"\r\n[seriald: {error}]\r\n".encode("utf-8")
+
+    return b""
+
+
+def display_attach_message(msg, stdout_fd):
+    data = attach_message_output(msg)
+    if data:
+        write_all(stdout_fd, data)
+
+
+def consume_attach_messages(buffer, handler):
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        if not line:
+            continue
+        handler(json.loads(line.decode("utf-8")))
+    return buffer
+
+
+def terminal_width(text):
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in "WF" else 1
+    return width
+
+
+class BottomLine:
+    PROMPT_TEXT = "serialctl@rv1126b:attach > "
+    PROMPT = (
+        "\x1b[1;36mserialctl\x1b[0m@"
+        "\x1b[1;35mrv1126b\x1b[0m:"
+        "\x1b[1;34mattach\x1b[0m "
+        "\x1b[1;33m>\x1b[0m "
+    )
+    ESCAPE_SEQUENCES = {
+        b"\x1b[D": "left",
+        b"\x1b[C": "right",
+        b"\x1b[A": "up",
+        b"\x1b[B": "down",
+        b"\x1b[H": "home",
+        b"\x1b[F": "end",
+        b"\x1b[1~": "home",
+        b"\x1b[3~": "delete",
+        b"\x1b[4~": "end",
+        b"\x1bOA": "up",
+        b"\x1bOB": "down",
+        b"\x1bOD": "left",
+        b"\x1bOC": "right",
+    }
+
+    def __init__(self, stdout_fd):
+        self.stdout_fd = stdout_fd
+        self.columns = 80
+        self.rows = 24
+        self.output_rows = 23
+        self.text = ""
+        self.cursor = 0
+        self.history = []
+        self.history_index = None
+        self.pending = bytearray()
+        self.escape_deadline = None
+        self.started = False
+
+    def _write(self, data):
+        write_all(self.stdout_fd, data)
+
+    def _read_size(self):
+        try:
+            size = os.get_terminal_size(self.stdout_fd)
+            if size.lines > 0 and size.columns > 0:
+                return size.lines, size.columns
+        except OSError:
+            pass
+        return 24, 80
+
+    def _set_layout(self):
+        self.output_rows = max(1, self.rows - 1)
+        self._write(
+            f"\x1b[1;{self.output_rows}r\x1b[1;1H\x1b[s".encode("ascii")
+        )
+
+    def _resize_if_needed(self):
+        rows, columns = self._read_size()
+        if (rows, columns) == (self.rows, self.columns):
+            return
+
+        self.rows = rows
+        self.columns = columns
+        self._write(b"\x1b[2J\x1b[H")
+        self._set_layout()
+
+    def start(self):
+        self.rows, self.columns = self._read_size()
+        self._write(b"\x1b[?1049h\x1b[2J\x1b[H")
+        self._set_layout()
+        self.started = True
+        self.redraw()
+
+    def stop(self):
+        if not self.started:
+            return
+        self._write(b"\x1b[r\x1b[?1049l")
+        self.started = False
+
+    def _visible_input(self):
+        prompt_width = terminal_width(self.PROMPT_TEXT)
+        available = max(1, self.columns - prompt_width)
+        start = 0
+
+        while (
+            start < self.cursor
+            and terminal_width(self.text[start:self.cursor]) > available
+        ):
+            start += 1
+
+        end = start
+        while end < len(self.text):
+            candidate = self.text[start:end + 1]
+            if terminal_width(candidate) > available:
+                break
+            end += 1
+
+        visible = self.text[start:end]
+        cursor_column = prompt_width + terminal_width(
+            self.text[start:self.cursor]
+        )
+        return visible, cursor_column
+
+    def redraw(self):
+        self._resize_if_needed()
+        visible, cursor_column = self._visible_input()
+        self._write(
+            f"\x1b[{self.rows};1H\x1b[2K".encode("ascii")
+            + self.PROMPT.encode("utf-8")
+            + visible.encode("utf-8")
+            + f"\x1b[{max(1, cursor_column + 1)}G".encode("ascii")
+        )
+
+    def output(self, data):
+        if not data:
+            return
+        self._resize_if_needed()
+        self._write(b"\x1b[u" + data + b"\x1b[s")
+        self.redraw()
+
+    def handle_message(self, msg):
+        self.output(attach_message_output(msg))
+
+    def input_timeout(self):
+        if self.escape_deadline is None:
+            return None
+        return max(0, self.escape_deadline - time.monotonic())
+
+    def flush_escape(self, send):
+        if (
+            self.escape_deadline is None
+            or time.monotonic() < self.escape_deadline
+        ):
+            return
+
+        data = bytes(self.pending)
+        self.pending.clear()
+        self.escape_deadline = None
+        send(data)
+
+    def _set_text(self, text):
+        self.text = text
+        self.cursor = len(text)
+        self.history_index = None
+
+    def _history_move(self, direction):
+        if not self.history:
+            return
+
+        if direction == "up":
+            if self.history_index is None:
+                self.history_index = len(self.history) - 1
+            else:
+                self.history_index = max(0, self.history_index - 1)
+            self.text = self.history[self.history_index]
+            self.cursor = len(self.text)
+            return
+
+        if self.history_index is None:
+            return
+
+        if self.history_index + 1 >= len(self.history):
+            self.text = ""
+            self.cursor = 0
+            self.history_index = None
+        else:
+            self.history_index += 1
+            self.text = self.history[self.history_index]
+            self.cursor = len(self.text)
+
+    def _apply_escape(self, action):
+        if action == "left":
+            self.cursor = max(0, self.cursor - 1)
+        elif action == "right":
+            self.cursor = min(len(self.text), self.cursor + 1)
+        elif action == "home":
+            self.cursor = 0
+        elif action == "end":
+            self.cursor = len(self.text)
+        elif action == "delete":
+            if self.cursor < len(self.text):
+                self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+        elif action in ("up", "down"):
+            self._history_move(action)
+
+    def _utf8_length(self, first):
+        if first < 0x80:
+            return 1
+        if 0xC2 <= first <= 0xDF:
+            return 2
+        if 0xE0 <= first <= 0xEF:
+            return 3
+        if 0xF0 <= first <= 0xF4:
+            return 4
+        return 1
+
+    def feed(self, data, send):
+        self.pending.extend(data)
+        changed = False
+        detach = False
+
+        while self.pending:
+            first = self.pending[0]
+
+            if first == 0x1D:
+                del self.pending[0]
+                detach = True
+                break
+
+            if first == 0x1B:
+                pending = bytes(self.pending)
+                action = next(
+                    (
+                        action
+                        for sequence, action in self.ESCAPE_SEQUENCES.items()
+                        if pending.startswith(sequence)
+                    ),
+                    None,
+                )
+                if action:
+                    sequence = next(
+                        sequence
+                        for sequence in self.ESCAPE_SEQUENCES
+                        if pending.startswith(sequence)
+                    )
+                    del self.pending[:len(sequence)]
+                    self.escape_deadline = None
+                    self._apply_escape(action)
+                    changed = True
+                    continue
+
+                if any(
+                    sequence.startswith(pending)
+                    for sequence in self.ESCAPE_SEQUENCES
+                ):
+                    if self.escape_deadline is None:
+                        self.escape_deadline = time.monotonic() + 0.05
+                    break
+
+                del self.pending[0]
+                self.escape_deadline = None
+                send(b"\x1b")
+                continue
+
+            if first in (0x0D, 0x0A):
+                del self.pending[0]
+                line = self.text.encode("utf-8") + bytes((first,))
+                send(line)
+                if self.text and (
+                    not self.history or self.history[-1] != self.text
+                ):
+                    self.history.append(self.text)
+                    self.history = self.history[-100:]
+                self.text = ""
+                self.cursor = 0
+                self.history_index = None
+                changed = True
+                continue
+
+            if first in (0x08, 0x7F):
+                del self.pending[0]
+                if self.cursor:
+                    self.text = (
+                        self.text[:self.cursor - 1]
+                        + self.text[self.cursor:]
+                    )
+                    self.cursor -= 1
+                    changed = True
+                continue
+
+            if first == 0x01:  # Ctrl+A
+                del self.pending[0]
+                self.cursor = 0
+                changed = True
+                continue
+
+            if first == 0x05:  # Ctrl+E
+                del self.pending[0]
+                self.cursor = len(self.text)
+                changed = True
+                continue
+
+            if first == 0x15:  # Ctrl+U
+                del self.pending[0]
+                self._set_text("")
+                changed = True
+                continue
+
+            if first == 0x17:  # Ctrl+W
+                del self.pending[0]
+                before = self.text[:self.cursor]
+                before = before.rstrip()
+                before = before[:before.rfind(" ") + 1]
+                self.text = before + self.text[self.cursor:]
+                self.cursor = len(before)
+                changed = True
+                continue
+
+            if first == 0x0B:  # Ctrl+K
+                del self.pending[0]
+                self.text = self.text[:self.cursor]
+                changed = True
+                continue
+
+            if first == 0x03:  # Ctrl+C
+                del self.pending[0]
+                send(b"\x03")
+                self._set_text("")
+                changed = True
+                continue
+
+            if first == 0x04:  # Ctrl+D
+                del self.pending[0]
+                if self.cursor < len(self.text):
+                    self.text = (
+                        self.text[:self.cursor]
+                        + self.text[self.cursor + 1:]
+                    )
+                    changed = True
+                else:
+                    send(b"\x04")
+                continue
+
+            if first < 0x20 or first == 0x7F:
+                del self.pending[0]
+                send(bytes((first,)))
+                continue
+
+            length = self._utf8_length(first)
+            if len(self.pending) < length:
+                break
+
+            raw = bytes(self.pending[:length])
+            try:
+                char = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                del self.pending[0]
+                send(raw[:1])
+                continue
+
+            del self.pending[:length]
+            if char.isprintable():
+                self.text = (
+                    self.text[:self.cursor]
+                    + char
+                    + self.text[self.cursor:]
+                )
+                self.cursor += len(char)
+                self.history_index = None
+                changed = True
+            else:
+                send(raw)
+
+        if changed:
+            self.redraw()
+        return detach
+
+
+def attach_raw_session(s, buffer, stdin_fd, stdout_fd):
+    old_term = termios.tcgetattr(stdin_fd)
+    write_all(
+        stdout_fd,
+        b"\r\n[serialctl attached; Ctrl+] to detach]\r\n",
+    )
+
+    try:
+        tty.setraw(stdin_fd)
+        s.setblocking(False)
+        buffer = consume_attach_messages(
+            buffer,
+            lambda msg: display_attach_message(msg, stdout_fd),
+        )
+
+        while True:
+            readable, _, _ = select.select([stdin_fd, s], [], [])
+
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 4096)
+                if not data:
+                    break
+
+                escape_at = data.find(b"\x1d")  # Ctrl+]
+                send_attach_data(
+                    s,
+                    data if escape_at < 0 else data[:escape_at],
+                )
+
+                if escape_at >= 0:
+                    break
+
+            if s in readable:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise RuntimeError("seriald closed the attach session")
+                buffer += chunk
+                buffer = consume_attach_messages(
+                    buffer,
+                    lambda msg: display_attach_message(msg, stdout_fd),
+                )
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+        s.close()
+        write_all(stdout_fd, b"\r\n[serialctl detached]\r\n")
+
+
+def attach_line_session(s, buffer, stdin_fd, stdout_fd):
+    old_term = termios.tcgetattr(stdin_fd)
+    line = BottomLine(stdout_fd)
+
+    def send(data):
+        send_attach_data(s, data)
+
+    try:
+        tty.setraw(stdin_fd)
+        s.setblocking(False)
+        line.start()
+        buffer = consume_attach_messages(buffer, line.handle_message)
+
+        while True:
+            timeout = line.input_timeout()
+            readable, _, _ = select.select(
+                [stdin_fd, s],
+                [],
+                [],
+                timeout,
+            )
+
+            if not readable:
+                line.flush_escape(send)
+                continue
+
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 4096)
+                if not data or line.feed(data, send):
+                    break
+
+            if s in readable:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise RuntimeError("seriald closed the attach session")
+                buffer += chunk
+                buffer = consume_attach_messages(buffer, line.handle_message)
+
+            line.flush_escape(send)
+    finally:
+        line.stop()
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+        s.close()
+        write_all(stdout_fd, b"\r\n[serialctl detached]\r\n")
+
+
+def attach(socket_path, actor_name, line_mode=True):
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("serialctl attach 需要在交互式终端中运行", file=sys.stderr)
+        sys.exit(2)
+
+    s = connect_socket(socket_path)
+    try:
+        s.sendall((json.dumps({
+            "cmd": "attach",
+            "actor": actor_name,
+        }, ensure_ascii=False) + "\n").encode("utf-8"))
+
+        buffer = b""
+        hello, buffer = recv_json_line(s, buffer)
+        if not hello.get("ok"):
+            print(hello.get("error", "attach failed"), file=sys.stderr)
+            s.close()
+            return
+
+        stdin_fd = sys.stdin.fileno()
+        stdout_fd = sys.stdout.fileno()
+        if line_mode:
+            attach_line_session(s, buffer, stdin_fd, stdout_fd)
+        else:
+            attach_raw_session(s, buffer, stdin_fd, stdout_fd)
+    except KeyboardInterrupt:
+        # Keep Ctrl+C safe if Python receives SIGINT outside raw mode.
+        s.close()
+    except Exception:
+        s.close()
+        raise
+
+
+def request(obj, socket_path):
+    s = connect_socket(socket_path)
+
+    with s:
+        s.sendall(
+            (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        )
+
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+
+    if not data:
+        raise RuntimeError("seriald returned no response")
+
+    return json.loads(data.decode("utf-8"))
+
+
+def actor(args):
+    return (
+        args.actor
+        or os.environ.get("SERIAL_ACTOR")
+        or "human"
+    )
+
+
+def latest_log():
+    return DEFAULT_LOG_DIR / "latest.log"
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="serialctl",
+        description="RV1126B serial control client",
+    )
+
+    ap.add_argument(
+        "--socket",
+        default=DEFAULT_SOCKET,
+    )
+
+    ap.add_argument(
+        "--actor",
+        help="TX source name, e.g. human/luna/codex/opencode",
+    )
+
+    sp = ap.add_subparsers(dest="command", required=True)
+
+    sp.add_parser("status")
+
+    p = sp.add_parser("send")
+    p.add_argument("text")
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="do not append newline",
+    )
+
+    p = sp.add_parser("wait")
+    p.add_argument("pattern")
+    p.add_argument("-t", "--timeout", type=float, default=30)
+    p.add_argument("--regex", action="store_true")
+
+    p = sp.add_parser("exec")
+    p.add_argument("text")
+    p.add_argument("-t", "--timeout", type=float, default=30)
+
+    p = sp.add_parser("tail")
+    p.add_argument("lines", nargs="?", type=int, default=100)
+
+    sp.add_parser("watch")
+
+    p = sp.add_parser(
+        "attach",
+        help="bottom-line interactive terminal; Ctrl+] to detach",
+    )
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="use transparent byte-by-byte terminal mode",
+    )
+
+    p = sp.add_parser("grep")
+    p.add_argument("pattern")
+    p.add_argument("-i", "--ignore-case", action="store_true")
+
+    args = ap.parse_args()
+
+    if args.command == "status":
+        r = request({"cmd": "status"}, args.socket)
+
+        print(f"connected : {r.get('connected')}")
+        print(f"device    : {r.get('device')}")
+        print(f"resolved  : {r.get('resolved_device')}")
+        print(f"baud      : {r.get('baud')}")
+        print(f"socket    : {args.socket}")
+        print(f"log       : {latest_log()}")
+        return
+
+    if args.command == "send":
+        text = args.text
+        if not args.raw:
+            text += "\n"
+
+        r = request({
+            "cmd": "send",
+            "text": text,
+            "actor": actor(args),
+        }, args.socket)
+
+        if not r.get("ok"):
+            print(r.get("error"), file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if args.command == "wait":
+        r = request({
+            "cmd": "wait",
+            "pattern": args.pattern,
+            "timeout": args.timeout,
+            "regex": args.regex,
+        }, args.socket)
+
+        if r.get("data"):
+            print(r["data"], end="")
+
+        if not r.get("matched"):
+            print(
+                f"\n等待超时: {args.pattern}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
+
+    if args.command == "exec":
+        r = request({
+            "cmd": "exec",
+            "command": args.text,
+            "timeout": args.timeout,
+            "actor": actor(args),
+        }, args.socket)
+
+        if r.get("data"):
+            print(r["data"], end="")
+
+        if not r.get("ok"):
+            print(
+                "\n" + r.get("error", "exec failed"),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        rc = r.get("rc")
+        if rc is not None and rc != 0:
+            sys.exit(rc)
+        return
+
+    if args.command == "attach":
+        attach(args.socket, actor(args), line_mode=not args.raw)
+        return
+
+    if args.command == "tail":
+        path = latest_log()
+
+        if not path.exists():
+            print(f"日志不存在: {path}", file=sys.stderr)
+            sys.exit(1)
+
+        q = collections.deque(maxlen=args.lines)
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                q.append(line)
+
+        print("".join(q), end="")
+        return
+
+    if args.command == "watch":
+        path = latest_log()
+
+        if not path.exists():
+            print(f"日志不存在: {path}", file=sys.stderr)
+            sys.exit(1)
+
+        os.execvp(
+            "tail",
+            ["tail", "-F", str(path)],
+        )
+
+    if args.command == "grep":
+        path = latest_log()
+
+        flags = re.IGNORECASE if args.ignore_case else 0
+        rx = re.compile(args.pattern, flags)
+
+        if not path.exists():
+            print(f"日志不存在: {path}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if rx.search(line):
+                    print(line, end="")
+        return
+
+
+if __name__ == "__main__":
+    main()
