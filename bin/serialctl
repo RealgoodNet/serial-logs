@@ -125,8 +125,68 @@ HIGHLIGHT_RULES = (
     ),
 )
 
+SHELL_PROMPT_PATTERN = (
+    rb"(?<![A-Za-z0-9_.-])"
+    rb"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:"
+    rb"(?:/|~)[^\r\n #$%]*[#%$]"
+)
+SHELL_PROMPT_RE = re.compile(SHELL_PROMPT_PATTERN)
+ANSI_CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+SHELL_PROMPT_PARTS_RE = re.compile(
+    r"^(?P<identity>[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:)"
+    r"(?P<path>(?:/|~)[^\r\n #$%]*)"
+    r"(?P<marker>[#%$])$"
+)
+SHELL_PROMPT_MARKER_COLORS = {
+    "#": b"\x1b[1;31m",
+    "%": b"\x1b[1;38;5;109m",
+    "$": b"\x1b[1;32m",
+}
+SHELL_PROMPT_IDENTITY_COLOR = b"\x1b[1;36m"
+SHELL_PROMPT_PATH_COLOR = b"\x1b[1;34m"
+SHELL_COMMAND_COLOR = b"\x1b[1;36m"
+
+
+def render_shell_prompt(prompt_text):
+    trailing = prompt_text[len(prompt_text.rstrip(" ")):]
+    core = prompt_text.rstrip(" ")
+    match = SHELL_PROMPT_PARTS_RE.fullmatch(core)
+    if not match:
+        return b"\x1b[1;32m" + prompt_text.encode("utf-8") + b"\x1b[0m"
+
+    reset = b"\x1b[0m"
+    return (
+        SHELL_PROMPT_IDENTITY_COLOR
+        + match.group("identity").encode("utf-8")
+        + reset
+        + SHELL_PROMPT_PATH_COLOR
+        + match.group("path").encode("utf-8")
+        + reset
+        + SHELL_PROMPT_MARKER_COLORS[match.group("marker")]
+        + match.group("marker").encode("ascii")
+        + reset
+        + trailing.encode("utf-8")
+    )
+
+
+def render_shell_input(text):
+    match = re.match(r"^(\s*)(\S+)", text)
+    if not match:
+        return text.encode("utf-8")
+
+    start, end = match.span(2)
+    return (
+        text[:start].encode("utf-8")
+        + SHELL_COMMAND_COLOR
+        + text[start:end].encode("utf-8")
+        + b"\x1b[0m"
+        + text[end:].encode("utf-8")
+    )
+
+
 HIGHLIGHT_REGEX = re.compile(
-    rb"(?P<critical>(?<![A-Za-z0-9_])"
+    rb"(?P<shell_prompt>" + SHELL_PROMPT_PATTERN + rb")"
+    rb"|(?P<critical>(?<![A-Za-z0-9_])"
     rb"(?:ERROR|ERR|FATAL|PANIC|OOPS|SEGFAULT|ASSERT)"
     rb"(?![A-Za-z0-9_]))"
     rb"|(?P<error_level>(?<![A-Za-z0-9_])E:)"
@@ -144,6 +204,7 @@ HIGHLIGHT_REGEX = re.compile(
     re.IGNORECASE,
 )
 HIGHLIGHT_REGEX_COLORS = {
+    "shell_prompt": SHELL_PROMPT_IDENTITY_COLOR,
     "critical": b"\x1b[1;31m",
     "error_level": b"\x1b[1;31m",
     "warning": b"\x1b[38;5;214m",
@@ -239,6 +300,10 @@ def highlight_serial_output(data, pending=b"", flush=False):
 
     # Apply regex rules in one pass so ANSI reset codes do not affect boundaries.
     def style_match(match):
+        if match.lastgroup == "shell_prompt":
+            return render_shell_prompt(
+                match.group(0).decode("utf-8", errors="replace")
+            )
         color = HIGHLIGHT_REGEX_COLORS[match.lastgroup]
         return color + match.group(0) + b"\x1b[0m"
 
@@ -309,6 +374,11 @@ class BottomLine:
         self.history_index = None
         self.pending = bytearray()
         self.highlight_pending = b""
+        self.prompt_text = self.PROMPT_TEXT
+        self.prompt = self.PROMPT.encode("utf-8")
+        self.prompt_scan = b""
+        self.command_echoes = []
+        self.command_output_buffer = b""
         self.escape_deadline = None
         self.started = False
 
@@ -340,6 +410,94 @@ class BottomLine:
         self._write(b"\x1b[2J\x1b[H")
         self._set_layout()
 
+    def _update_shell_prompt(self, data):
+        self.prompt_scan = (self.prompt_scan + data)[-1024:]
+        plain = ANSI_CSI_RE.sub(b"", self.prompt_scan)
+        matches = list(SHELL_PROMPT_RE.finditer(plain))
+        if not matches:
+            return False
+
+        prompt_text = matches[-1].group(0).decode("utf-8") + " "
+        if prompt_text == self.prompt_text:
+            return False
+
+        self.prompt_text = prompt_text
+        self.prompt = render_shell_prompt(prompt_text)
+        return True
+
+    def _remember_command(self, text):
+        if not text:
+            return
+        self.command_echoes.append(text.encode("utf-8"))
+        self.command_echoes = self.command_echoes[-100:]
+
+    @staticmethod
+    def _command_echo_start(line, command):
+        content = line.rstrip(b"\r\n")
+        if content == command:
+            return 0
+
+        prompt_match = SHELL_PROMPT_RE.search(content)
+        if not prompt_match:
+            return None
+
+        start = prompt_match.end()
+        while start < len(content) and content[start] in b" \t":
+            start += 1
+        if content[start:] == command:
+            return start
+        return None
+
+    @staticmethod
+    def _style_command_echo(line, start):
+        end = start
+        while end < len(line) and line[end] not in b" \t\r\n":
+            end += 1
+        if end == start:
+            return line
+        return (
+            line[:start]
+            + SHELL_COMMAND_COLOR
+            + line[start:end]
+            + b"\x1b[0m"
+            + line[end:]
+        )
+
+    def _highlight_command_echoes(self, data, flush=False):
+        if not self.command_echoes and not self.command_output_buffer and not flush:
+            return data
+
+        self.command_output_buffer += data
+        if flush:
+            lines = [self.command_output_buffer] if self.command_output_buffer else []
+            self.command_output_buffer = b""
+        else:
+            parts = self.command_output_buffer.split(b"\n")
+            trailing = parts.pop()
+            lines = [part + b"\n" for part in parts]
+            self.command_output_buffer = trailing
+
+        output = bytearray()
+        for line in lines:
+            matched_index = None
+            command_start = None
+            for index, command in enumerate(self.command_echoes):
+                command_start = self._command_echo_start(line, command)
+                if command_start is not None:
+                    matched_index = index
+                    break
+
+            if matched_index is not None:
+                line = self._style_command_echo(line, command_start)
+                del self.command_echoes[matched_index]
+            output.extend(line)
+
+        if not self.command_echoes and self.command_output_buffer:
+            output.extend(self.command_output_buffer)
+            self.command_output_buffer = b""
+
+        return bytes(output)
+
     def start(self):
         self.rows, self.columns = self._read_size()
         self._write(b"\x1b[?1049h\x1b[2J\x1b[H")
@@ -350,6 +508,14 @@ class BottomLine:
     def stop(self):
         if not self.started:
             return
+        command_data = self._highlight_command_echoes(b"", flush=True)
+        if command_data:
+            command_data, self.highlight_pending = highlight_serial_output(
+                command_data,
+                self.highlight_pending,
+                flush=True,
+            )
+            self._write(b"\x1b[u" + command_data + b"\x1b[s")
         if self.highlight_pending:
             pending, self.highlight_pending = highlight_serial_output(
                 b"",
@@ -362,7 +528,7 @@ class BottomLine:
         self.started = False
 
     def _visible_input(self):
-        prompt_width = terminal_width(self.PROMPT_TEXT)
+        prompt_width = terminal_width(self.prompt_text)
         available = max(1, self.columns - prompt_width)
         start = 0
 
@@ -390,8 +556,8 @@ class BottomLine:
         visible, cursor_column = self._visible_input()
         self._write(
             f"\x1b[{self.rows};1H\x1b[2K".encode("ascii")
-            + self.PROMPT.encode("utf-8")
-            + visible.encode("utf-8")
+            + self.prompt
+            + render_shell_input(visible)
             + f"\x1b[{max(1, cursor_column + 1)}G".encode("ascii")
         )
 
@@ -399,11 +565,15 @@ class BottomLine:
         if not data:
             return
         self._resize_if_needed()
+        prompt_changed = self._update_shell_prompt(data)
+        data = self._highlight_command_echoes(data)
         data, self.highlight_pending = highlight_serial_output(
             data,
             self.highlight_pending,
         )
         if not data:
+            if prompt_changed:
+                self.redraw()
             return
         self._write(
             b"\x1b[u"
@@ -538,12 +708,14 @@ class BottomLine:
 
             if first in (0x0D, 0x0A):
                 del self.pending[0]
-                line = self.text.encode("utf-8") + bytes((first,))
+                command_text = self.text
+                line = command_text.encode("utf-8") + bytes((first,))
+                self._remember_command(command_text)
                 send(line)
-                if self.text and (
-                    not self.history or self.history[-1] != self.text
+                if command_text and (
+                    not self.history or self.history[-1] != command_text
                 ):
-                    self.history.append(self.text)
+                    self.history.append(command_text)
                     self.history = self.history[-100:]
                 self.text = ""
                 self.cursor = 0

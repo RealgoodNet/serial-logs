@@ -959,8 +959,8 @@ serialctl attach
 - 输入内容在本地编辑，按 Enter 后发送整行。
 - 支持左右移动、Home/End、Backspace、Delete 和上下历史。
 - 使用 `Ctrl+]` 退出。
-- 提示符配色与 zsh 有层次关联但不相同：`serialctl` 为加粗青色，`rv1126b` 为加粗紫色，`attach` 为加粗蓝色，`>` 为黄色。
-- 少量高频网络状态使用快速高亮：`[network.c][rk_network_get_cable_state]` 为 256 色 `214`，`[wlan0] link down` 为加粗橙色；错误关键词为红色，成功/启动节点为绿色或青色，高频 `MD: md_area` 信息为暗灰色。
+- 识别到板端 `user@host:/path#`、`%` 或 `$` 提示符后，底部同步用户、主机、当前路径和提示符字符；`#` 为加粗红色，`%` 为较平缓的加粗蓝色，命令首词为加粗青色。
+- 板端提示符和已发送命令回显也会高亮；少量高频网络状态使用快速高亮：`[network.c][rk_network_get_cable_state]` 为 256 色 `214`，`[wlan0] link down` 为加粗橙色；错误关键词为红色，成功/启动节点为绿色或青色，高频 `MD: md_area` 信息为暗灰色。
 - 高亮只改变固定模式的终端显示，不改变串口日志文件、JSONL 或 `--raw` 输出。
 
 ### 13.2 原始逐字节模式
