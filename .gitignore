@@ -1,0 +1,8 @@
+# Runtime serial captures are local evidence, not source files.
+rv1126b/*.log
+rv1126b/*.jsonl
+rv1126b/latest.log
+
+# Python-generated files.
+__pycache__/
+*.py[cod]
