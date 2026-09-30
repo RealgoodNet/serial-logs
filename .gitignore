@@ -2,6 +2,9 @@
 rv1126b/*.log
 rv1126b/*.jsonl
 rv1126b/latest.log
+w14/*.log
+w14/*.jsonl
+w14/latest.log
 
 # Python-generated files.
 __pycache__/
