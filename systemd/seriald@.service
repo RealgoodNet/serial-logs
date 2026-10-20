@@ -1,0 +1,15 @@
+[Unit]
+Description=Serial Broker (%i)
+Documentation=file:%h/work/serial-logs/README.md
+After=default.target
+
+[Service]
+Type=simple
+# 实例名 = 模板参数 %i；配置在 %h/work/serial-logs/config/%i.conf
+# 日志在 %h/work/serial-logs/logs/%i/；socket 在 %t/seriald-%i.sock
+ExecStart=/usr/bin/sg dialout -c '%h/work/serial-logs/bin/seriald -s %i'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

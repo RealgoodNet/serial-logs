@@ -3,6 +3,7 @@
 import argparse
 import base64
 import collections
+import configparser
 import json
 import os
 import re
@@ -16,12 +17,78 @@ import unicodedata
 from pathlib import Path
 
 
-DEFAULT_SOCKET = os.path.join(
-    os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"),
-    "seriald-rv1126b.sock",
-)
+NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 
-DEFAULT_LOG_DIR = Path.home() / "work/serial-logs/rv1126b"
+REPO_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_DIR = REPO_DIR / "config"
+DEFAULT_LOG_ROOT = REPO_DIR / "logs"
+
+EXAMPLE_CONF = "example.conf"
+
+
+def runtime_dir():
+    return Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    )
+
+
+def instance_socket(name):
+    return runtime_dir() / f"seriald-{name}.sock"
+
+
+def instance_from_socket(socket_path):
+    stem = Path(socket_path).stem
+    if stem.startswith("seriald-"):
+        return stem[len("seriald-"):]
+    return stem
+
+
+def available_instances():
+    if not DEFAULT_CONFIG_DIR.is_dir():
+        return []
+    return sorted(
+        p.stem
+        for p in DEFAULT_CONFIG_DIR.glob("*.conf")
+        if p.name != EXAMPLE_CONF
+    )
+
+
+def load_instance(name):
+    if not NAME_RE.match(name):
+        raise SystemExit(
+            f"实例名不合法: {name!r}（只允许小写字母、数字、下划线、短横线）"
+        )
+
+    path = DEFAULT_CONFIG_DIR / f"{name}.conf"
+    if not path.is_file():
+        raise SystemExit(
+            f"实例不存在: {name}（配置 {path} 不存在）\n"
+            f"可用实例: {', '.join(available_instances()) or '（无）'}"
+        )
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    cp.read(path, encoding="utf-8")
+
+    def get(section, key, default=""):
+        if not cp.has_section(section):
+            return default
+        return cp.get(section, key, fallback=default)
+
+    log_dir = get("log", "dir").strip()
+    log_dir = (
+        Path(log_dir).expanduser()
+        if log_dir
+        else DEFAULT_LOG_ROOT / name
+    )
+
+    return {
+        "name": name,
+        "config_path": path,
+        "device": get("serial", "device").strip(),
+        "baud": get("serial", "baud").strip(),
+        "log_dir": log_dir,
+        "prompt": get("attach", "prompt").strip(),
+    }
 
 
 def connect_socket(socket_path):
@@ -33,7 +100,8 @@ def connect_socket(socket_path):
         s.close()
         print(
             f"seriald socket 不存在: {socket_path}\n"
-            f"检查: systemctl --user status seriald-rv1126b",
+            f"检查: systemctl --user status "
+            f"seriald@{instance_from_socket(socket_path)}",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -125,11 +193,12 @@ HIGHLIGHT_RULES = (
     ),
 )
 
-SHELL_PROMPT_PATTERN = (
+DEFAULT_SHELL_PROMPT_PATTERN = (
     rb"(?<![A-Za-z0-9_.-])"
     rb"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:"
     rb"(?:/|~)[^\r\n #$%]*[#%$]"
 )
+SHELL_PROMPT_PATTERN = DEFAULT_SHELL_PROMPT_PATTERN
 SHELL_PROMPT_RE = re.compile(SHELL_PROMPT_PATTERN)
 ANSI_CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 SHELL_PROMPT_PARTS_RE = re.compile(
@@ -184,25 +253,29 @@ def render_shell_input(text):
     )
 
 
-HIGHLIGHT_REGEX = re.compile(
-    rb"(?P<shell_prompt>" + SHELL_PROMPT_PATTERN + rb")"
-    rb"|(?P<critical>(?<![A-Za-z0-9_])"
-    rb"(?:ERROR|ERR|FATAL|PANIC|OOPS|SEGFAULT|ASSERT)"
-    rb"(?![A-Za-z0-9_]))"
-    rb"|(?P<error_level>(?<![A-Za-z0-9_])E:)"
-    rb"|(?P<warning>(?<![A-Za-z0-9_])"
-    rb"(?:fail(?:ed|ure)?|cannot|can.t|can not|invalid|unrecognized|"
-    rb"unknown raw|no such file|not found|could not|"
-    rb"unsupported|not support(?:ed)?|timeout|timed out|"
-    rb"broken pipe|lost (?:video|audio) packet|session not found)"
-    rb"(?![A-Za-z0-9_]))"
-    rb"|(?P<success>(?<![A-Za-z0-9_])"
-    rb"(?:OK|success(?:fully)?|connected|ready|mounted|started|login:)"
-    rb"(?![A-Za-z0-9_]))"
-    rb"|(?P<startup>U-Boot|Starting kernel|Linux version|DDR4?)"
-    rb"|(?P<debug>MD: md_area)",
-    re.IGNORECASE,
-)
+def build_highlight_regex(prompt_pattern):
+    return re.compile(
+        rb"(?P<shell_prompt>" + prompt_pattern + rb")"
+        rb"|(?P<critical>(?<![A-Za-z0-9_])"
+        rb"(?:ERROR|ERR|FATAL|PANIC|OOPS|SEGFAULT|ASSERT)"
+        rb"(?![A-Za-z0-9_]))"
+        rb"|(?P<error_level>(?<![A-Za-z0-9_])E:)"
+        rb"|(?P<warning>(?<![A-Za-z0-9_])"
+        rb"(?:fail(?:ed|ure)?|cannot|can.t|can not|invalid|unrecognized|"
+        rb"unknown raw|no such file|not found|could not|"
+        rb"unsupported|not support(?:ed)?|timeout|timed out|"
+        rb"broken pipe|lost (?:video|audio) packet|session not found)"
+        rb"(?![A-Za-z0-9_]))"
+        rb"|(?P<success>(?<![A-Za-z0-9_])"
+        rb"(?:OK|success(?:fully)?|connected|ready|mounted|started|login:)"
+        rb"(?![A-Za-z0-9_]))"
+        rb"|(?P<startup>U-Boot|Starting kernel|Linux version|DDR4?)"
+        rb"|(?P<debug>MD: md_area)",
+        re.IGNORECASE,
+    )
+
+
+HIGHLIGHT_REGEX = build_highlight_regex(SHELL_PROMPT_PATTERN)
 HIGHLIGHT_REGEX_COLORS = {
     "shell_prompt": SHELL_PROMPT_IDENTITY_COLOR,
     "critical": b"\x1b[1;31m",
@@ -977,19 +1050,95 @@ def actor(args):
     )
 
 
-def latest_log():
-    return DEFAULT_LOG_DIR / "latest.log"
+def latest_log(cfg):
+    return Path(cfg["log_dir"]) / "latest.log"
+
+
+def probe_status(name, timeout=1.0):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(str(instance_socket(name)))
+        s.sendall(json.dumps({"cmd": "status"}).encode("utf-8") + b"\n")
+
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+
+        if not data:
+            return None
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def cmd_list():
+    names = available_instances()
+    if not names:
+        print("（没有任何实例配置；参考 config/example.conf 新增）")
+        return
+
+    print(f"{'实例':<12} {'状态':<8} {'波特率':<8} 设备 / 日志")
+    for name in names:
+        try:
+            cfg = load_instance(name)
+        except SystemExit as e:
+            print(f"{name:<12} {'配置错误':<8} {e}")
+            continue
+
+        status = probe_status(name)
+        if status is None:
+            state = "未运行"
+        else:
+            state = "已连接" if status.get("connected") else "等待设备"
+
+        print(
+            f"{name:<12} {state:<8} {cfg['baud']:<8} {cfg['device']}"
+        )
+        print(f"{'':<12} {'':<8} {'':<8} -> {cfg['log_dir']}")
+
+
+def apply_instance(name):
+    global SHELL_PROMPT_PATTERN, SHELL_PROMPT_RE, HIGHLIGHT_REGEX
+
+    cfg = load_instance(name)
+
+    prompt = cfg.get("prompt")
+    if prompt:
+        try:
+            pattern = prompt.encode("utf-8")
+            re.compile(pattern)
+        except re.error as e:
+            raise SystemExit(f"配置里的 prompt 正则无效: {e}")
+
+        SHELL_PROMPT_PATTERN = pattern
+        SHELL_PROMPT_RE = re.compile(pattern)
+        HIGHLIGHT_REGEX = build_highlight_regex(pattern)
+
+    BottomLine.PROMPT_TEXT = f"serialctl@{name}:attach > "
+    BottomLine.PROMPT = (
+        "\x1b[1;36mserialctl\x1b[0m@"
+        f"\x1b[1;35m{name}\x1b[0m:"
+        "\x1b[1;34mattach\x1b[0m "
+        "\x1b[1;33m>\x1b[0m "
+    )
+    return cfg
 
 
 def main():
     ap = argparse.ArgumentParser(
         prog="serialctl",
-        description="RV1126B serial control client",
+        description="串口实例控制客户端（实例名见 serialctl list）",
     )
 
     ap.add_argument(
-        "--socket",
-        default=DEFAULT_SOCKET,
+        "-s",
+        "--serial",
+        help="实例名（对应 config/<名字>.conf）",
     )
 
     ap.add_argument(
@@ -999,9 +1148,22 @@ def main():
 
     sp = ap.add_subparsers(dest="command", required=True)
 
-    sp.add_parser("status")
+    def sub(name, **kwargs):
+        p = sp.add_parser(name, **kwargs)
+        # 允许把 -s 写在子命令后面：serialctl attach -s atk1126b
+        # 用 SUPPRESS 避免覆盖全局 -s 的取值
+        p.add_argument(
+            "-s",
+            "--serial",
+            default=argparse.SUPPRESS,
+            help="实例名（与全局 -s 等价，可写在子命令前后）",
+        )
+        return p
 
-    p = sp.add_parser("send")
+    sub("status")
+    sub("list")
+
+    p = sub("send")
     p.add_argument("text")
     p.add_argument(
         "--raw",
@@ -1009,21 +1171,21 @@ def main():
         help="do not append newline",
     )
 
-    p = sp.add_parser("wait")
+    p = sub("wait")
     p.add_argument("pattern")
     p.add_argument("-t", "--timeout", type=float, default=30)
     p.add_argument("--regex", action="store_true")
 
-    p = sp.add_parser("exec")
+    p = sub("exec")
     p.add_argument("text")
     p.add_argument("-t", "--timeout", type=float, default=30)
 
-    p = sp.add_parser("tail")
+    p = sub("tail")
     p.add_argument("lines", nargs="?", type=int, default=100)
 
-    sp.add_parser("watch")
+    sub("watch")
 
-    p = sp.add_parser(
+    p = sub(
         "attach",
         help="bottom-line interactive terminal; Ctrl+] to detach",
     )
@@ -1033,21 +1195,39 @@ def main():
         help="use transparent byte-by-byte terminal mode",
     )
 
-    p = sp.add_parser("grep")
+    p = sub("grep")
     p.add_argument("pattern")
     p.add_argument("-i", "--ignore-case", action="store_true")
+    p.add_argument("-c", "--count", action="store_true")
 
     args = ap.parse_args()
 
+    if args.command == "list":
+        cmd_list()
+        return
+
+    if not args.serial:
+        print(
+            "必须指定实例：serialctl -s <实例名> <命令>\n"
+            f"可用实例: {', '.join(available_instances()) or '（无）'}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    instance_cfg = apply_instance(args.serial)
+    socket_path = instance_socket(args.serial)
+
     if args.command == "status":
-        r = request({"cmd": "status"}, args.socket)
+        r = request({"cmd": "status"}, socket_path)
 
         print(f"connected : {r.get('connected')}")
         print(f"device    : {r.get('device')}")
         print(f"resolved  : {r.get('resolved_device')}")
         print(f"baud      : {r.get('baud')}")
-        print(f"socket    : {args.socket}")
-        print(f"log       : {latest_log()}")
+        print(f"instance  : {r.get('instance', args.serial)}")
+        print(f"config    : {r.get('config', instance_cfg.get('config_path'))}")
+        print(f"socket    : {socket_path}")
+        print(f"log       : {r.get('log_dir', instance_cfg.get('log_dir'))}")
         return
 
     if args.command == "send":
@@ -1059,7 +1239,7 @@ def main():
             "cmd": "send",
             "text": text,
             "actor": actor(args),
-        }, args.socket)
+        }, socket_path)
 
         if not r.get("ok"):
             print(r.get("error"), file=sys.stderr)
@@ -1072,7 +1252,7 @@ def main():
             "pattern": args.pattern,
             "timeout": args.timeout,
             "regex": args.regex,
-        }, args.socket)
+        }, socket_path)
 
         if r.get("data"):
             print(r["data"], end="")
@@ -1091,7 +1271,7 @@ def main():
             "command": args.text,
             "timeout": args.timeout,
             "actor": actor(args),
-        }, args.socket)
+        }, socket_path)
 
         if r.get("data"):
             print(r["data"], end="")
@@ -1109,11 +1289,11 @@ def main():
         return
 
     if args.command == "attach":
-        attach(args.socket, actor(args), line_mode=not args.raw)
+        attach(str(socket_path), actor(args), line_mode=not args.raw)
         return
 
     if args.command == "tail":
-        path = latest_log()
+        path = latest_log(instance_cfg)
 
         if not path.exists():
             print(f"日志不存在: {path}", file=sys.stderr)
@@ -1129,7 +1309,7 @@ def main():
         return
 
     if args.command == "watch":
-        path = latest_log()
+        path = latest_log(instance_cfg)
 
         if not path.exists():
             print(f"日志不存在: {path}", file=sys.stderr)
@@ -1141,7 +1321,7 @@ def main():
         )
 
     if args.command == "grep":
-        path = latest_log()
+        path = latest_log(instance_cfg)
 
         flags = re.IGNORECASE if args.ignore_case else 0
         rx = re.compile(args.pattern, flags)
@@ -1151,6 +1331,10 @@ def main():
             sys.exit(1)
 
         with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if args.count:
+                n = sum(1 for line in f if rx.search(line))
+                print(n)
+                return
             for line in f:
                 if rx.search(line):
                     print(line, end="")

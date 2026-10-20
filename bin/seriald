@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import configparser
 import datetime
 import json
 import os
@@ -16,14 +17,163 @@ from pathlib import Path
 import serial
 
 
+NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_DIR = REPO_DIR / "config"
+DEFAULT_LOG_ROOT = REPO_DIR / "logs"
+
+BYTESIZE_MAP = {
+    5: serial.FIVEBITS,
+    6: serial.SIXBITS,
+    7: serial.SEVENBITS,
+    8: serial.EIGHTBITS,
+}
+PARITY_MAP = {
+    "none": serial.PARITY_NONE,
+    "even": serial.PARITY_EVEN,
+    "odd": serial.PARITY_ODD,
+    "mark": serial.PARITY_MARK,
+    "space": serial.PARITY_SPACE,
+}
+STOPBITS_MAP = {
+    "1": serial.STOPBITS_ONE,
+    "1.5": serial.STOPBITS_ONE_POINT_FIVE,
+    "2": serial.STOPBITS_TWO,
+}
+FLOW_MAP = ("none", "rtscts", "xonxoff")
+
+
+def runtime_dir():
+    return Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    )
+
+
+def instance_socket(name):
+    return runtime_dir() / f"seriald-{name}.sock"
+
+
+def load_instance(name, config_dir):
+    if not NAME_RE.match(name):
+        raise SystemExit(
+            f"实例名不合法: {name!r}（只允许小写字母、数字、下划线、短横线）"
+        )
+
+    path = Path(config_dir) / f"{name}.conf"
+    if not path.is_file():
+        raise SystemExit(f"配置不存在: {path}")
+
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    cp.read(path, encoding="utf-8")
+
+    def get(section, key, default=None):
+        if not cp.has_section(section):
+            return default
+        return cp.get(section, key, fallback=default)
+
+    device = (get("serial", "device") or "").strip()
+    if not device:
+        raise SystemExit(f"{path}: [serial] device 未配置")
+
+    try:
+        baud = int((get("serial", "baud") or "115200").strip())
+        databits = int((get("serial", "databits") or "8").strip())
+        wait_log_interval = float(
+            (get("log", "wait_log_interval") or "600").strip()
+        )
+        retention_days = int(
+            (get("log", "retention_days") or "0").strip()
+        )
+    except ValueError as e:
+        raise SystemExit(f"{path}: 数值字段无效: {e}")
+
+    parity = (get("serial", "parity") or "none").strip().lower()
+    stopbits = (get("serial", "stopbits") or "1").strip()
+    flow = (get("serial", "flow") or "none").strip().lower()
+
+    if databits not in BYTESIZE_MAP:
+        raise SystemExit(f"{path}: databits 必须是 5/6/7/8")
+    if parity not in PARITY_MAP:
+        raise SystemExit(f"{path}: parity 必须是 {'/'.join(PARITY_MAP)}")
+    if stopbits not in STOPBITS_MAP:
+        raise SystemExit(f"{path}: stopbits 必须是 1/1.5/2")
+    if flow not in FLOW_MAP:
+        raise SystemExit(f"{path}: flow 必须是 {'/'.join(FLOW_MAP)}")
+    if wait_log_interval < 1:
+        wait_log_interval = 1
+    if retention_days < 0:
+        retention_days = 0
+
+    log_dir = (get("log", "dir") or "").strip()
+    if log_dir:
+        log_dir = Path(log_dir).expanduser()
+    else:
+        log_dir = DEFAULT_LOG_ROOT / name
+
+    return {
+        "name": name,
+        "config_path": path,
+        "device": os.path.expanduser(device),
+        "baud": baud,
+        "databits": databits,
+        "parity": parity,
+        "stopbits": stopbits,
+        "flow": flow,
+        "log_dir": log_dir,
+        "wait_log_interval": wait_log_interval,
+        "retention_days": retention_days,
+    }
+
+
 class DailyLogger:
-    def __init__(self, directory):
+    # .log 是人读的：写入前去掉 ANSI/控制符；.jsonl 保持原始字节（转义完整）。
+    CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+    OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+    CHARSET_RE = re.compile(r"\x1b[()][A-Za-z0-9]")
+    ESC_OTHER_RE = re.compile(r"\x1b[@-Z\\-_]")
+
+    @classmethod
+    def clean_for_log(cls, text):
+        text = cls.OSC_RE.sub("", text)
+        text = cls.CSI_RE.sub("", text)
+        text = cls.CHARSET_RE.sub("", text)
+        text = cls.ESC_OTHER_RE.sub("", text)
+        text = text.replace("\x07", "")
+        # \r 按行处理：同一行内只保留最后一段（模拟终端覆盖）
+        lines = []
+        for line in text.split("\n"):
+            line = line.rstrip("\r")
+            if "\r" in line:
+                line = line.split("\r")[-1]
+            lines.append(line)
+        return "\n".join(lines)
+
+    def __init__(self, directory, retention_days=0):
         self.dir = Path(directory).expanduser()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.day = None
         self.logf = None
         self.jsonf = None
+        self.retention_days = retention_days
+        self._cleanup()
+
+    def _cleanup(self):
+        if self.retention_days <= 0:
+            return
+
+        cutoff = time.time() - self.retention_days * 86400
+
+        for pattern in ("*.log", "*.jsonl"):
+            for path in self.dir.glob(pattern):
+                if path.name.startswith("latest."):
+                    continue
+                try:
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except OSError:
+                    pass
 
     def _open(self):
         day = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -71,8 +221,8 @@ class DailyLogger:
             else:
                 text = data
 
-            # human-readable log
-            parts = text.replace("\r", "").split("\n")
+            # human-readable log（清洗 ANSI/控制符；jsonl 保留原始数据）
+            parts = self.clean_for_log(text).split("\n")
             if not parts:
                 parts = [""]
 
@@ -102,10 +252,12 @@ class DailyLogger:
 class SerialState:
     MAX_HISTORY = 2 * 1024 * 1024
 
-    def __init__(self, device, baud, logger):
-        self.device = device
-        self.baud = baud
+    def __init__(self, instance, logger):
+        self.instance = instance
+        self.device = instance["device"]
+        self.baud = instance["baud"]
         self.logger = logger
+        self.wait_log_interval = instance["wait_log_interval"]
 
         self.ser = None
         self.connected = False
@@ -199,15 +351,32 @@ class SerialState:
 
     def status(self):
         return {
+            "instance": self.instance["name"],
+            "config": str(self.instance["config_path"]),
             "connected": self.connected,
             "device": self.device,
             "resolved_device": self.resolved_device,
             "baud": self.baud,
+            "log_dir": str(self.instance["log_dir"]),
             "rx_seq": self.current_seq(),
         }
 
 
 STATE = None
+
+
+def open_serial(instance):
+    return serial.Serial(
+        port=instance["device"],
+        baudrate=instance["baud"],
+        bytesize=BYTESIZE_MAP[instance["databits"]],
+        parity=PARITY_MAP[instance["parity"]],
+        stopbits=STOPBITS_MAP[instance["stopbits"]],
+        rtscts=(instance["flow"] == "rtscts"),
+        xonxoff=(instance["flow"] == "xonxoff"),
+        timeout=0.2,
+        write_timeout=2,
+    )
 
 
 def serial_worker():
@@ -220,15 +389,7 @@ def serial_worker():
             try:
                 resolved = os.path.realpath(STATE.device)
 
-                ser = serial.Serial(
-                    port=STATE.device,
-                    baudrate=STATE.baud,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=0.2,
-                    write_timeout=2,
-                )
+                ser = open_serial(STATE.instance)
 
                 STATE.ser = ser
                 STATE.connected = True
@@ -242,7 +403,7 @@ def serial_worker():
 
             except Exception as e:
                 now = time.monotonic()
-                if now - last_wait_log > 30:
+                if now - last_wait_log > STATE.wait_log_interval:
                     STATE.logger.write(
                         "event",
                         data=str(e),
@@ -488,17 +649,32 @@ class ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
 def main():
     global STATE
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--device", required=True)
-    ap.add_argument("--baud", type=int, required=True)
-    ap.add_argument("--log-dir", required=True)
-    ap.add_argument("--socket", required=True)
+    ap = argparse.ArgumentParser(
+        prog="seriald",
+        description="串口实例 broker（配置驱动）",
+    )
+    ap.add_argument(
+        "-s",
+        "--serial",
+        required=True,
+        help="实例名，对应 config/<名字>.conf",
+    )
+    ap.add_argument(
+        "--config-dir",
+        default=str(DEFAULT_CONFIG_DIR),
+        help="配置目录（默认 <repo>/config）",
+    )
     args = ap.parse_args()
 
-    logger = DailyLogger(args.log_dir)
-    STATE = SerialState(args.device, args.baud, logger)
+    instance = load_instance(args.serial, args.config_dir)
 
-    socket_path = os.path.expanduser(args.socket)
+    logger = DailyLogger(
+        instance["log_dir"],
+        instance["retention_days"],
+    )
+    STATE = SerialState(instance, logger)
+
+    socket_path = instance_socket(instance["name"])
     os.makedirs(os.path.dirname(socket_path), exist_ok=True)
 
     try:
@@ -508,7 +684,12 @@ def main():
 
     logger.write(
         "event",
-        data=f"device={args.device} baud={args.baud}",
+        data=(
+            f"instance={instance['name']} device={instance['device']} "
+            f"baud={instance['baud']} databits={instance['databits']} "
+            f"parity={instance['parity']} stopbits={instance['stopbits']} "
+            f"flow={instance['flow']} log_dir={instance['log_dir']}"
+        ),
         event="SERIALD_START",
     )
 
@@ -517,7 +698,7 @@ def main():
         daemon=True,
     ).start()
 
-    with ThreadingUnixServer(socket_path, Handler) as server:
+    with ThreadingUnixServer(str(socket_path), Handler) as server:
         os.chmod(socket_path, 0o600)
 
         try:
