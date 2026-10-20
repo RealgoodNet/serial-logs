@@ -77,12 +77,12 @@ process_week() {
 
     local first_date monday sunday archive_dir archive
     first_date=${files[0]%.jsonl}
-    monday=$(monday_of_date "$first_date") || { log "  跳过 $week（日期无法解析）"; return 0; }
-    sunday=$(sunday_of_date "$first_date") || { log "  跳过 $week（日期无法解析）"; return 0; }
+    monday=$(monday_of_date "$first_date") || { log "  跳过 $week（日期无法解析）"; return 2; }
+    sunday=$(sunday_of_date "$first_date") || { log "  跳过 $week（日期无法解析）"; return 2; }
 
     if [ ! "$sunday" \< "$TODAY" ]; then
         log "  跳过 $week（未结束，周日 $sunday）"
-        return 0
+        return 2
     fi
 
     archive_dir="$dir/archive"
@@ -95,7 +95,7 @@ process_week() {
 
     if [ -e "$archive" ]; then
         log "  $week 已归档，跳过（$(basename "$archive")）"
-        return 0
+        return 2
     fi
 
     log "  $week：${#files[@]} 天，$(fmt_size "$bytes") -> $(basename "$archive")"
@@ -152,6 +152,7 @@ process_week() {
 }
 
 total_weeks=0
+skipped_weeks=0
 failed=0
 
 for dir in "$BASE_DIR"/*/; do
@@ -191,18 +192,22 @@ for dir in "$BASE_DIR"/*/; do
             continue
         fi
         read -r -a flist <<< "${weeks[$w]}"
-        total_weeks=$(( total_weeks + 1 ))
-        process_week "$dir" "$w" "${flist[@]}" || failed=$(( failed + 1 ))
+        process_week "$dir" "$w" "${flist[@]}"
+        case $? in
+            0) total_weeks=$(( total_weeks + 1 )) ;;
+            2) skipped_weeks=$(( skipped_weeks + 1 )) ;;
+            *) failed=$(( failed + 1 )) ;;
+        esac
     done
 done
 
 if [ "$total_weeks" -eq 0 ]; then
-    log "没有可归档的完整周"
+    log "没有可归档的完整周（跳过 $skipped_weeks 个未结束/已归档）"
 else
     if [ "$APPLY" -eq 1 ]; then
-        log "结束：处理 $total_weeks 个周，失败 $failed 个"
+        log "结束：归档 $total_weeks 个周，跳过 $skipped_weeks 个，失败 $failed 个"
     else
-        log "演练结束：$total_weeks 个周待归档（加 --apply 执行）"
+        log "演练结束：$total_weeks 个周待归档，跳过 $skipped_weeks 个（加 --apply 执行）"
     fi
 fi
 
